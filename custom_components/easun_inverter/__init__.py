@@ -1,238 +1,195 @@
-"""The Easun ISolar Inverter integration."""
+"""
+custom_components.easun_inverter
+--------------------------------
+Domain bootstrap + service registration for settings control.
+Reading/sensor logic remains in sensor.py; this file only wires services
+to the new Settings API in easunpy.async_isolar.
+"""
+
 from __future__ import annotations
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, ServiceCall
-import homeassistant.helpers.config_validation as cv
 import logging
-from easunpy.modbusclient import create_request 
-from datetime import datetime
-import json
-import os
-from aiofiles import open as async_open
-from aiofiles.os import makedirs
-import asyncio
+from typing import Any
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.const import Platform
+
+from .const import DOMAIN  # if you already have a const.py; otherwise inline "easun_inverter"
+from easunpy.async_isolar import AsyncISolar
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = "easun_inverter"
+PLATFORMS = [Platform.SENSOR]
 
-# List of platforms to support. There should be a matching .py file for each,
-# eg. switch.py and sensor.py
-PLATFORMS: list[Platform] = [Platform.SENSOR]
-
-# Use config_entry_only_config_schema since we only support config flow
-CONFIG_SCHEMA = cv.config_entry_only_config_schema("easun_inverter")
-
-async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
-    """Migrate old entry."""
-    _LOGGER.debug("Migrating from version %s", config_entry.version)
-
-    if config_entry.version < 4:
-        new_data = {**config_entry.data}
-        
-        # Add model with default value if it doesn't exist
-        if "model" not in new_data:
-            new_data["model"] = "ISOLAR_SMG_II_11K"
-            
-        # Update the entry with new data and version
-        hass.config_entries.async_update_entry(
-            config_entry,
-            data=new_data,
-            version=4
-        )
-        _LOGGER.info("Migration to version %s successful", 4)
-
-    return True
-
-async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """Set up the Easun ISolar Inverter component."""
-    _LOGGER.debug("Setting up Easun ISolar Inverter component")
-    return True
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Easun ISolar Inverter from a config entry."""
-    if entry.version < 4:
-        if not await async_migrate_entry(hass, entry):
-            return False
-
-    model = entry.data["model"]  # No default - should be required
-    _LOGGER.warning(f"Setting up inverter with model: {model}, config data: {entry.data}")
-    
-    # Initialize domain data
+    """Set up the integration from a config entry."""
+    # Ensure data bag
     hass.data.setdefault(DOMAIN, {})
-    
-    async def handle_register_scan(call: ServiceCall) -> None:
-        """Handle the register scan service."""
-        start = call.data.get("start_register", 0)
-        count = call.data.get("register_count", 5)
-        
-        # Get the coordinator from the entry we stored in sensor.py
-        entry_data = hass.data[DOMAIN].get(entry.entry_id)
-        if not entry_data or "coordinator" not in entry_data:
-            _LOGGER.error("No coordinator found. Is the integration set up?")
-            return
-            
-        coordinator = entry_data["coordinator"]
-        inverter = coordinator._isolar
-        
-        _LOGGER.debug(f"Starting register scan from {start} for {count} registers")
-        
-        # Create register groups in chunks of 10
-        register_groups = []
-        for chunk_start in range(start, start + count, 10):
-            chunk_size = min(10, start + count - chunk_start)  # Handle last chunk
-            register_groups.append((chunk_start, chunk_size))
-        
-        # Read all registers in bulk
-        results = []
-        try:
-            responses = await inverter._read_registers_bulk(register_groups, "Int")
-            if responses:
-                for group_idx, response in enumerate(responses):
-                    if response:  # Check if we got values for this group
-                        chunk_start = register_groups[group_idx][0]
-                        for i, value in enumerate(response):
-                            if value != 0:  # Only store non-zero values
-                                reg = chunk_start + i
-                                results.append({
-                                    "register": reg,
-                                    "hex": f"0x{reg:04x}",
-                                    "value": value,
-                                    "raw": f"Register {reg}: {value}"
-                                })
-        except Exception as e:
-            _LOGGER.error(f"Error reading registers: {e}")
-        
-        # Store results in hass.data for the sensor
-        scan_data = {
-            "timestamp": datetime.now().isoformat(),
-            "results": results,
-            "start_register": start,
-            "count": count
-        }
-        hass.data[DOMAIN]["last_scan"] = scan_data
-        
-        # Save to www folder
-        www_dir = hass.config.path("www")
-        try:
-            if not os.path.exists(www_dir):
-                await makedirs(www_dir)
-            
-            filename = os.path.join(www_dir, "easun_register_scan.json")
-            async with async_open(filename, 'w') as f:
-                await f.write(json.dumps(scan_data, indent=2))
-            _LOGGER.info(f"Scan complete. Found {len(results)} registers with values")
-        except Exception as e:
-            _LOGGER.error(f"Error saving scan results: {e}")
+    # Create (or reuse) API used by sensors and by services.
+    # We assume your config_flow stores local_ip in entry.data["local_ip"] (adapt if different).
+    local_ip = entry.data.get("local_ip", "0.0.0.0")
+    port = entry.data.get("port", 502)
 
-    async def handle_device_scan(call: ServiceCall) -> None:
-        """Handle the device ID scan service."""
-        start_id = call.data.get("start_id", 0)
-        end_id = call.data.get("end_id", 5)
-        
-        entry_data = hass.data[DOMAIN].get(entry.entry_id)
-        if not entry_data or "coordinator" not in entry_data:
-            _LOGGER.error("No coordinator found. Is the integration set up?")
-            return
-            
-        coordinator = entry_data["coordinator"]
-        inverter = coordinator._isolar
-        
-        _LOGGER.debug(f"Starting device scan from ID {start_id} to {end_id}")
-        
-        results = []
-        
-        for device_id in range(start_id, end_id + 1):
-            try:
-                # Create request
-                request = [create_request(
-                    inverter._get_next_transaction_id(),
-                    0x0001, device_id, 0x03,
-                    0x0115,
-                    1
-                )]
-                
-                # Send request and get raw response
-                responses = await inverter.client.send_bulk(request)
-                _LOGGER.debug(f"Responses: {responses}")
-                response_hex = responses[0] if responses else None
-                
-                result = {
-                    "device_id": device_id,
-                    "hex": f"0x{device_id:02x}",
-                    "request": request,
-                    "response": response_hex,
-                }
-        
-                ERROR_RESPONSE = "00010002ff04"  # Protocol error response
-                
-                if response_hex: 
-                    if response_hex[4:] == ERROR_RESPONSE:
-                        result["status"] = "Protocol Error"
-                        _LOGGER.debug(f"Device 0x{device_id:02x} gave protocol error: {response_hex}")
-                    else:
-                        result["status"] = "Valid Response"
-                        _LOGGER.debug(f"Device 0x{device_id:02x} gave valid response: {response_hex}")
-                else:
-                    _LOGGER.debug(f"Device 0x{device_id:02x} gave no response")
-                    result["status"] = "No Response"
-                
-                results.append(result)
-                
-            except Exception as e:
-                _LOGGER.debug(f"Error with device ID {device_id:02x}: {e}")
-                results.append({
-                    "device_id": device_id,
-                    "hex": f"0x{device_id:02x}",
-                    "status": f"Error: {str(e)}",
-                    "request": request if 'request' in locals() else None,
-                    "response": None
-                })
-            
-            await asyncio.sleep(0.1)  # Small delay between requests
-        
-        # Store results
-        scan_data = {
-            "timestamp": datetime.now().isoformat(),
-            "results": results,
-            "start_id": start_id,
-            "end_id": end_id
-        }
-        hass.data[DOMAIN]["device_scan"] = scan_data
-        
-        # Log summary
-        valid_responses = [r for r in results if r["status"] == "Valid Response"]
-        _LOGGER.info(f"Device scan complete. Found {len(valid_responses)} valid responses")
-        for r in valid_responses:
-            _LOGGER.info(f"Device {r['hex']}: Request={r['request']}, Response={r['response']}, Decoded={r.get('decoded')}")
+    api = AsyncISolar(local_ip=local_ip, port=port)
+    hass.data[DOMAIN][entry.entry_id] = {"api": api}
 
-    # Register both services
-    hass.services.async_register(DOMAIN, "register_scan", handle_register_scan)
-    hass.services.async_register(DOMAIN, "device_scan", handle_device_scan)
-    
-    # Forward the setup to the sensor platform
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    
+
+    # ----------------------------
+    # Service registration
+    # ----------------------------
+    async def _svc_send_ascii(call: ServiceCall):
+        cmd = call.data["command"]
+        ok = await api.apply(cmd)
+        _LOGGER.info("send_ascii_setting(%s) -> %s", cmd, "ACK" if ok else "NAK")
+
+    async def _svc_set_out_src(call: ServiceCall):
+        ok = await api.set_output_source_priority(call.data["mode"])
+        _LOGGER.info("set_output_source_priority -> %s", ok)
+
+    async def _svc_set_chg_src(call: ServiceCall):
+        ok = await api.set_charger_source_priority(call.data["mode"])
+        _LOGGER.info("set_charger_source_priority -> %s", ok)
+
+    async def _svc_set_grid(call: ServiceCall):
+        ok = await api.set_grid_working_range(call.data["mode"])
+        _LOGGER.info("set_grid_working_range -> %s", ok)
+
+    async def _svc_set_batt_type(call: ServiceCall):
+        ok = await api.set_battery_type(call.data["battery_type"])
+        _LOGGER.info("set_battery_type -> %s", ok)
+
+    async def _svc_set_out_mode(call: ServiceCall):
+        ok = await api.set_output_mode(call.data["mode"])
+        _LOGGER.info("set_output_mode -> %s", ok)
+
+    async def _svc_set_v(call: ServiceCall):
+        ok = await api.set_rated_output_voltage(call.data["volts"])
+        _LOGGER.info("set_rated_output_voltage -> %s", ok)
+
+    async def _svc_set_f(call: ServiceCall):
+        ok = await api.set_rated_output_frequency(call.data["hz"])
+        _LOGGER.info("set_rated_output_frequency -> %s", ok)
+
+    async def _svc_set_mnchg(call: ServiceCall):
+        ok = await api.set_max_charging_current(call.data["amps"], call.data.get("parallel_id", 0))
+        _LOGGER.info("set_max_charging_current -> %s", ok)
+
+    async def _svc_set_muchg(call: ServiceCall):
+        ok = await api.set_max_utility_charging_current(call.data["amps"], call.data.get("parallel_id", 0))
+        _LOGGER.info("set_max_utility_charging_current -> %s", ok)
+
+    async def _svc_set_pbcv(call: ServiceCall):
+        ok = await api.set_battery_recharge_voltage(call.data["volts"])
+        _LOGGER.info("set_battery_recharge_voltage -> %s", ok)
+
+    async def _svc_set_pbdv(call: ServiceCall):
+        ok = await api.set_battery_redischarge_voltage(call.data["volts"])
+        _LOGGER.info("set_battery_redischarge_voltage -> %s", ok)
+
+    async def _svc_set_psdv(call: ServiceCall):
+        ok = await api.set_battery_cutoff_voltage(call.data["volts"])
+        _LOGGER.info("set_battery_cutoff_voltage -> %s", ok)
+
+    async def _svc_set_pcvv(call: ServiceCall):
+        ok = await api.set_battery_bulk_voltage(call.data["volts"])
+        _LOGGER.info("set_battery_bulk_voltage -> %s", ok)
+
+    async def _svc_set_pbft(call: ServiceCall):
+        ok = await api.set_battery_float_voltage(call.data["volts"])
+        _LOGGER.info("set_battery_float_voltage -> %s", ok)
+
+    async def _svc_set_pcvt(call: ServiceCall):
+        ok = await api.set_cv_stage_max_time(call.data["minutes"])
+        _LOGGER.info("set_cv_stage_max_time -> %s", ok)
+
+    async def _svc_set_time(call: ServiceCall):
+        ok = await api.set_datetime()  # optional explicit time field could be parsed
+        _LOGGER.info("set_datetime(now) -> %s", ok)
+
+    async def _svc_eq_enable(call: ServiceCall):
+        ok = await api.equalization_enable(call.data["enabled"])
+        _LOGGER.info("equalization_enable -> %s", ok)
+
+    async def _svc_eq_time(call: ServiceCall):
+        ok = await api.equalization_set_time(call.data["minutes"])
+        _LOGGER.info("equalization_set_time -> %s", ok)
+
+    async def _svc_eq_period(call: ServiceCall):
+        ok = await api.equalization_set_period(call.data["days"])
+        _LOGGER.info("equalization_set_period -> %s", ok)
+
+    async def _svc_eq_voltage(call: ServiceCall):
+        ok = await api.equalization_set_voltage(call.data["volts"])
+        _LOGGER.info("equalization_set_voltage -> %s", ok)
+
+    async def _svc_eq_overtime(call: ServiceCall):
+        ok = await api.equalization_set_over_time(call.data["minutes"])
+        _LOGGER.info("equalization_set_over_time -> %s", ok)
+
+    async def _svc_eq_now(call: ServiceCall):
+        ok = await api.equalization_activate_now(call.data["active"])
+        _LOGGER.info("equalization_activate_now -> %s", ok)
+
+    async def _svc_pbatcd(call: ServiceCall):
+        ok = await api.battery_control(call.data["a"], call.data["b"], call.data["c"])
+        _LOGGER.info("battery_control -> %s", ok)
+
+    async def _svc_pbmaxdisc(call: ServiceCall):
+        ok = await api.set_max_discharge_current(call.data["amps"])
+        _LOGGER.info("set_max_discharge_current -> %s", ok)
+
+    async def _svc_flag(call: ServiceCall):
+        ok = await api.flag_set(call.data["flag"], call.data["enable"])
+        _LOGGER.info("flag_set -> %s", ok)
+
+    async def _svc_rtey(call: ServiceCall):
+        ok = await api.reset_pv_load_energy()
+        _LOGGER.info("reset_pv_load_energy -> %s", ok)
+
+    async def _svc_rtdl(call: ServiceCall):
+        ok = await api.erase_data_log()
+        _LOGGER.info("erase_data_log -> %s", ok)
+
+    # Register services
+    hass.services.async_register(DOMAIN, "send_ascii_setting", _svc_send_ascii)
+    hass.services.async_register(DOMAIN, "set_output_source_priority", _svc_set_out_src)
+    hass.services.async_register(DOMAIN, "set_charger_source_priority", _svc_set_chg_src)
+    hass.services.async_register(DOMAIN, "set_grid_working_range", _svc_set_grid)
+    hass.services.async_register(DOMAIN, "set_battery_type", _svc_set_batt_type)
+    hass.services.async_register(DOMAIN, "set_output_mode", _svc_set_out_mode)
+    hass.services.async_register(DOMAIN, "set_output_rated_voltage", _svc_set_v)
+    hass.services.async_register(DOMAIN, "set_output_rated_frequency", _svc_set_f)
+    hass.services.async_register(DOMAIN, "set_max_charging_current", _svc_set_mnchg)
+    hass.services.async_register(DOMAIN, "set_max_utility_charging_current", _svc_set_muchg)
+    hass.services.async_register(DOMAIN, "set_battery_recharge_voltage", _svc_set_pbcv)
+    hass.services.async_register(DOMAIN, "set_battery_redischarge_voltage", _svc_set_pbdv)
+    hass.services.async_register(DOMAIN, "set_battery_cutoff_voltage", _svc_set_psdv)
+    hass.services.async_register(DOMAIN, "set_battery_bulk_voltage", _svc_set_pcvv)
+    hass.services.async_register(DOMAIN, "set_battery_float_voltage", _svc_set_pbft)
+    hass.services.async_register(DOMAIN, "set_cv_stage_max_time", _svc_set_pcvt)
+    hass.services.async_register(DOMAIN, "set_datetime", _svc_set_time)
+    hass.services.async_register(DOMAIN, "equalization_enable", _svc_eq_enable)
+    hass.services.async_register(DOMAIN, "equalization_set_time", _svc_eq_time)
+    hass.services.async_register(DOMAIN, "equalization_set_period", _svc_eq_period)
+    hass.services.async_register(DOMAIN, "equalization_set_voltage", _svc_eq_voltage)
+    hass.services.async_register(DOMAIN, "equalization_set_over_time", _svc_eq_overtime)
+    hass.services.async_register(DOMAIN, "equalization_activate_now", _svc_eq_now)
+    hass.services.async_register(DOMAIN, "battery_control", _svc_pbatcd)
+    hass.services.async_register(DOMAIN, "set_max_discharge_current", _svc_pbmaxdisc)
+    hass.services.async_register(DOMAIN, "flag_set", _svc_flag)
+    hass.services.async_register(DOMAIN, "reset_pv_load_energy", _svc_rtey)
+    hass.services.async_register(DOMAIN, "erase_data_log", _svc_rtdl)
+
     return True
+
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    _LOGGER.debug("Unloading Easun ISolar Inverter config entry")
-    
-    # Cleanup any update listeners
-    if entry.entry_id in hass.data[DOMAIN]:
-        if "update_listener" in hass.data[DOMAIN][entry.entry_id]:
-            _LOGGER.debug("Cancelling update listener")
-            hass.data[DOMAIN][entry.entry_id]["update_listener"]()
-    
-    # Unload the sensor platform
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    
-    # Clean up domain data
-    if unload_ok and entry.entry_id in hass.data[DOMAIN]:
-        _LOGGER.debug("Removing entry data")
-        hass.data[DOMAIN].pop(entry.entry_id)
-    
-    return unload_ok 
+    api: AsyncISolar = hass.data[DOMAIN][entry.entry_id]["api"]
+    await api.stop()
+    hass.data[DOMAIN].pop(entry.entry_id, None)
+    return unload_ok
